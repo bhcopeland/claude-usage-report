@@ -8,33 +8,164 @@ writes a single HTML file. Nothing is uploaded anywhere.
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
+import math
 import os
+import re
 import sys
+import urllib.request
 import webbrowser
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FIELDS = ("input", "cache_write", "cache_read", "output")
+TOKEN_FIELDS = ("input", "cache_write", "cache_write_1h", "cache_read", "output")
+
+PRICING_URL = "https://platform.claude.com/docs/en/about-claude/pricing.md"
+PRICING_CACHE = Path.home() / ".cache" / "claude-usage-report" / "pricing.md"
+MODEL_ALIASES = {
+    "claude-3-5-haiku": "claude-haiku-3-5",
+    "claude-opus-4-0": "claude-opus-4",
+    "claude-sonnet-4-0": "claude-sonnet-4",
+}
+PRICE_COLUMNS = (
+    "base input",
+    "5m cache write",
+    "1h cache write",
+    "cache hit",
+    "output",
+)
+
+
+@dataclass
+class Pricing:
+    models: dict = field(default_factory=dict)
+    long_prompt: dict = field(default_factory=dict)
+    source: str = ""
+
+
+def model_id_from_name(name: str) -> tuple[str, int | None]:
+    clean = re.sub(r"<[^>]+>", "", name)
+    clean = re.sub(r"\(\[[^\]]*\]\([^)]*\)\)", "", clean)
+    clean = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", clean)
+    over = re.search(r"prompts over ([\d,]+) tokens", clean)
+    threshold = int(over.group(1).replace(",", "")) if over else None
+    clean = re.sub(r"\([^)]*\)", "", clean).strip().lower()
+    return "-".join(re.split(r"[\s.]+", clean)), threshold
+
+
+def parse_pricing(markdown: str, source: str) -> Pricing:
+    pricing = Pricing(source=source)
+    lines = markdown.splitlines()
+    for index, line in enumerate(lines):
+        header = [c.strip().lower() for c in line.strip().strip("|").split("|")]
+        if not line.lstrip().startswith("|") or not all(
+            any(col in h for h in header) for col in PRICE_COLUMNS
+        ):
+            continue
+        columns = [
+            next(i for i, h in enumerate(header) if col in h) for col in PRICE_COLUMNS
+        ]
+        for row in lines[index + 2 :]:
+            if not row.lstrip().startswith("|"):
+                break
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            if len(cells) < len(header):
+                continue
+            amounts = []
+            for col in columns:
+                match = re.search(r"\$\s*([\d.]+)", cells[col])
+                if not match:
+                    break
+                amounts.append(float(match.group(1)))
+            model, threshold = model_id_from_name(cells[0])
+            if len(amounts) != len(columns) or not model.startswith("claude-"):
+                continue
+            if threshold is None:
+                pricing.models.setdefault(model, tuple(amounts))
+            else:
+                pricing.long_prompt[model] = (threshold, tuple(amounts))
+        break
+    return pricing
+
+
+def default_compare_model(pricing: Pricing) -> str | None:
+    opus = [m for m in pricing.models if m.startswith("claude-opus-")]
+    if not opus:
+        return None
+    return min(
+        opus,
+        key=lambda m: (
+            pricing.models[m][0],
+            pricing.models[m][4],
+            [-ord(c) for c in m],
+        ),
+    )
+
+
+def load_pricing(
+    pricing_file: Path | None, url: str = PRICING_URL, cache: Path = PRICING_CACHE
+) -> tuple[Pricing, str]:
+    if pricing_file is not None:
+        pricing = parse_pricing(
+            pricing_file.read_text(encoding="utf-8"), str(pricing_file)
+        )
+        return pricing, f"from {pricing_file}"
+    try:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "claude-usage-report"}
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            markdown = response.read().decode("utf-8", errors="replace")
+        pricing = parse_pricing(markdown, url)
+        if pricing.models:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(markdown, encoding="utf-8")
+            except OSError:
+                pass
+            return pricing, f"fetched from {url} on {date.today().isoformat()}"
+        problem = "the pricing page had no model price table I could read"
+    except (OSError, ValueError) as exc:
+        problem = f"could not fetch {url} ({exc})"
+    try:
+        fetched = date.fromtimestamp(cache.stat().st_mtime).isoformat()
+        pricing = parse_pricing(
+            cache.read_text(encoding="utf-8", errors="replace"), url
+        )
+    except OSError:
+        return Pricing(), problem
+    if pricing.models:
+        return pricing, f"{problem}; using the copy saved on {fetched}"
+    return Pricing(), problem
 
 
 @dataclass
 class Usage:
     input: int = 0
     cache_write: int = 0
+    cache_write_1h: int = 0
     cache_read: int = 0
     output: int = 0
     calls: int = 0
+    cost_input: float = 0.0
+    cost_write: float = 0.0
+    cost_read: float = 0.0
+    cost_output: float = 0.0
+    cost_compare: float = 0.0
+    unpriced: int = 0
 
     def add(self, other: Usage) -> None:
-        for name in FIELDS:
-            setattr(self, name, getattr(self, name) + getattr(other, name))
-        self.calls += other.calls
+        for f in fields(self):
+            setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
 
     def input_total(self) -> int:
         return self.input + self.cache_write
+
+    def cost(self) -> float:
+        return self.cost_input + self.cost_write + self.cost_read + self.cost_output
 
     def as_dict(self) -> dict:
         return {
@@ -42,7 +173,58 @@ class Usage:
             "out": self.output,
             "read": self.cache_read,
             "calls": self.calls,
+            "cost": round(self.cost(), 2),
+            "cmp": round(self.cost_compare, 2),
+            "c_in": round(self.cost_input, 2),
+            "c_w": round(self.cost_write, 2),
+            "c_r": round(self.cost_read, 2),
+            "c_out": round(self.cost_output, 2),
+            "unpriced": self.unpriced,
         }
+
+
+def normalise_model(model: str) -> str:
+    name = model.split("[", 1)[0].strip().lower()
+    if "claude-" in name:
+        name = name[name.index("claude-") :]
+    name = re.sub(r"-v\d+(:\d+)?$", "", name)
+    name = re.sub(r"[-@]\d{8}$", "", name)
+    return MODEL_ALIASES.get(name, name)
+
+
+def prices_for(model: str, prompt_tokens: int, pricing: Pricing):
+    name = normalise_model(model)
+    long_prompt = pricing.long_prompt.get(name)
+    if long_prompt is not None and prompt_tokens > long_prompt[0]:
+        return long_prompt[1]
+    return pricing.models.get(name)
+
+
+def price_usage(usage: Usage, prices) -> tuple[float, float, float, float]:
+    base, write_5m, write_1h, read, output = prices
+    one_hour = min(usage.cache_write_1h, usage.cache_write)
+    return (
+        usage.input * base / 1e6,
+        ((usage.cache_write - one_hour) * write_5m + one_hour * write_1h) / 1e6,
+        usage.cache_read * read / 1e6,
+        usage.output * output / 1e6,
+    )
+
+
+def apply_costs(calls: list[Call], compare_model: str, pricing: Pricing) -> None:
+    for call in calls:
+        u = call.usage
+        prompt = u.input + u.cache_write + u.cache_read
+        prices = prices_for(call.model, prompt, pricing)
+        if prices is None:
+            u.unpriced = u.calls
+        else:
+            u.cost_input, u.cost_write, u.cost_read, u.cost_output = price_usage(
+                u, prices
+            )
+        compare = prices_for(compare_model, prompt, pricing)
+        if compare is not None:
+            u.cost_compare = sum(price_usage(u, compare))
 
 
 @dataclass
@@ -99,9 +281,15 @@ def parse_claude_line(line: str):
         return None
     message_id = message.get("id")
     key = (message_id, record.get("requestId")) if message_id else None
+    creation = usage.get("cache_creation")
     values = Usage(
         input=usage.get("input_tokens") or 0,
         cache_write=usage.get("cache_creation_input_tokens") or 0,
+        cache_write_1h=(
+            (creation.get("ephemeral_1h_input_tokens") or 0)
+            if isinstance(creation, dict)
+            else 0
+        ),
         cache_read=usage.get("cache_read_input_tokens") or 0,
         output=usage.get("output_tokens") or 0,
         calls=1,
@@ -125,7 +313,7 @@ def scan_claude(root: Path) -> list[Call]:
             if existing is None:
                 calls[key] = Call(day, model, values)
                 continue
-            for name in FIELDS:
+            for name in TOKEN_FIELDS:
                 setattr(
                     existing.usage,
                     name,
@@ -186,7 +374,9 @@ def scan_codex(root: Path) -> list[Call]:
     return calls
 
 
-def summarise(name: str, calls: list[Call], today: date) -> dict | None:
+def summarise(
+    name: str, calls: list[Call], today: date, priced: bool = False, compare=""
+) -> dict | None:
     if not calls:
         return None
     daily: dict[str, Usage] = defaultdict(Usage)
@@ -212,6 +402,23 @@ def summarise(name: str, calls: list[Call], today: date) -> dict | None:
         best_day = max(daily, key=lambda d: pick(daily[d]))
         records[label] = [best_day, pick(daily[best_day])]
 
+    if priced:
+        best_cost_day = max(daily, key=lambda d: daily[d].cost())
+        records["cost"] = [best_cost_day, round(daily[best_cost_day].cost(), 2)]
+
+    this_month = months.get(today.isoformat()[:7], Usage())
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    scale = days_in_month / today.day
+    month_now = {
+        "ym": today.isoformat()[:7],
+        "days": today.day,
+        "days_in_month": days_in_month,
+        "cost": round(this_month.cost(), 2),
+        "cmp": round(this_month.cost_compare, 2),
+        "projected": round(this_month.cost() * scale, 2),
+        "projected_cmp": round(this_month.cost_compare * scale, 2),
+    }
+
     week_cutoff = (today - timedelta(days=7)).isoformat()
     last7 = Usage()
     for day, usage in daily.items():
@@ -220,12 +427,25 @@ def summarise(name: str, calls: list[Call], today: date) -> dict | None:
 
     return {
         "name": name,
+        "priced": priced,
+        "compare": compare,
+        "month_now": month_now,
         "first_day": min(daily),
         "today": daily.get(today.isoformat(), Usage()).as_dict(),
         "last7": last7.as_dict(),
         "total": total.as_dict(),
         "records": records,
-        "daily": [[d, *daily[d].as_dict().values()] for d in sorted(daily)],
+        "daily": [
+            [
+                d,
+                daily[d].input_total(),
+                daily[d].output,
+                daily[d].cache_read,
+                daily[d].calls,
+                round(daily[d].cost(), 2),
+            ]
+            for d in sorted(daily)
+        ],
         "months": [
             {
                 "ym": ym,
@@ -241,8 +461,22 @@ def summarise(name: str, calls: list[Call], today: date) -> dict | None:
     }
 
 
-def render(sections: list[dict], days: int, generated: str) -> str:
-    data = json.dumps({"sections": sections, "days": days, "generated": generated})
+def render(
+    sections: list[dict],
+    days: int,
+    generated: str,
+    budget: float | None = None,
+    pricing_note: str = "",
+) -> str:
+    data = json.dumps(
+        {
+            "sections": sections,
+            "days": days,
+            "generated": generated,
+            "budget": budget,
+            "pricing_note": pricing_note,
+        }
+    )
     for char, escaped in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026")):
         data = data.replace(char, escaped)
     return TEMPLATE.replace("__DATA__", data)
@@ -296,6 +530,10 @@ function fmt(n) {
   if (n >= 1e3) return Math.round(n / 1e3) + 'K';
   return String(n);
 }
+function money(n) {
+  if (n >= 100) return '$' + Math.round(n).toLocaleString('en-GB');
+  return '$' + n.toFixed(2);
+}
 function el(tag, attrs, html) {
   const e = document.createElement(tag);
   Object.entries(attrs || {}).forEach(([k, v]) => e.setAttribute(k, v));
@@ -342,7 +580,72 @@ function tokenLayout(tickformat, dtick) {
     yaxis2: { overlaying: 'y', side: 'right', title: 'cache read', exponentformat: 'B', showgrid: false, rangemode: 'tozero' },
   };
 }
-function tokenCells(u) { return `<td>${fmt(u.in)}</td><td>${fmt(u.out)}</td><td>${fmt(u.read)}</td><td>${u.calls.toLocaleString('en-GB')}</td>`; }
+function tokenCells(u, priced) {
+  const cost = priced ? `<td>${money(u.cost)}</td>` : '';
+  return `<td>${fmt(u.in)}</td><td>${fmt(u.out)}</td><td>${fmt(u.read)}</td><td>${u.calls.toLocaleString('en-GB')}</td>${cost}`;
+}
+function tableHead(first, priced) {
+  return `<tr><th>${first}</th><th>Input</th><th>Output</th><th>Cache read</th><th>API calls</th>${priced ? '<th>API cost</th>' : ''}</tr>`;
+}
+function renderCost(root, s) {
+  const m = s.month_now;
+  root.appendChild(el('h3', {}, 'What this would cost on the API'));
+  root.appendChild(el('p', { class: 'note' },
+    `Standard per-token API prices, ${text(DATA.pricing_note)}. Each call is priced at the model it used, with cache writes split into 5 minute and 1 hour.`
+    + ' Excludes negotiated discounts, Bedrock or Vertex pricing, US-only inference and server tool fees.'));
+  const items = [
+    [money(m.cost), `${monthLabel(m.ym)} so far (${m.days} of ${m.days_in_month} days)`, '#ef9a9a'],
+    [money(m.projected), `${monthLabel(m.ym)} projected`, '#ef9a9a'],
+    [money(s.records.cost[1]), `Most expensive day<br>${dayLabel(s.records.cost[0])}`],
+    [money(s.total.cost), 'All-time'],
+  ];
+  if (s.compare) items.splice(2, 0, [money(m.projected_cmp), `Projected if all on ${text(s.compare)}`]);
+  if (DATA.budget) {
+    const perDay = m.cost / m.days;
+    const lasts = perDay > 0 ? Math.floor(DATA.budget / perDay) : null;
+    items.push([lasts === null ? '-' : `${lasts} days`, `${money(DATA.budget)} budget lasts at this month's rate`]);
+  }
+  cards(root, items);
+  if (s.total.unpriced) {
+    root.appendChild(el('p', { class: 'note' },
+      `${s.total.unpriced.toLocaleString('en-GB')} calls used models with no price on the pricing page and are left out of the cost.`));
+  }
+
+  const months = s.months.slice().reverse();
+  const x = months.map(mm => mm.ym);
+  const modelNames = [...new Set(s.months.flatMap(mm => Object.keys(mm.models)))].sort();
+  const traces = modelNames.map((name, i) => ({
+    x, y: months.map(mm => (mm.models[name] || { cost: 0 }).cost), name: text(name), type: 'bar',
+    marker: { color: PALETTE[i % PALETTE.length] },
+    hovertemplate: `<b>%{x|%B %Y}</b><br>${text(name)}: $%{y:,.0f}<extra></extra>`,
+  }));
+  if (s.compare) traces.push({
+    x, y: months.map(mm => mm.cmp), name: `All on ${text(s.compare)}`, type: 'scatter', mode: 'lines+markers',
+    line: { color: '#ffffff', width: 2, dash: 'dot' },
+    hovertemplate: `<b>%{x|%B %Y}</b><br>All on ${text(s.compare)}: $%{y:,.0f}<extra></extra>`,
+  });
+  const shapes = DATA.budget ? [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: DATA.budget, y1: DATA.budget,
+    line: { color: '#ef5350', width: 2, dash: 'dash' } }] : [];
+  root.appendChild(el('h3', {}, 'API cost by month and model'));
+  chart(root, traces, {
+    barmode: 'stack', margin: { l: 70, r: 20, t: 10, b: 50 }, height: 360, shapes,
+    xaxis: { gridcolor: '#2a3a5e', type: 'date', tickformat: '%b %Y', dtick: 'M1', tickangle: -45, automargin: true },
+    yaxis: { gridcolor: '#2a3a5e', title: 'dollars', tickprefix: '$', separatethousands: true },
+    legend: { orientation: 'h', y: -0.35, x: 0 },
+  });
+
+  root.appendChild(el('h3', {}, 'Where the cost goes'));
+  chart(root, [
+    ['c_r', 'Cache reads', C.read], ['c_w', 'Cache writes', '#ba68c8'], ['c_out', 'Output', C.out], ['c_in', 'Uncached input', C.in],
+  ].map(([key, name, colour]) => ({
+    x, y: months.map(mm => mm[key]), name, type: 'bar', marker: { color: colour },
+    hovertemplate: `<b>%{x|%B %Y}</b><br>${name}: $%{y:,.0f}<extra></extra>`,
+  })), {
+    barmode: 'stack', margin: { l: 70, r: 20, t: 10, b: 50 }, shapes,
+    xaxis: { gridcolor: '#2a3a5e', type: 'date', tickformat: '%b %Y', dtick: 'M1', tickangle: -45, automargin: true },
+    yaxis: { gridcolor: '#2a3a5e', title: 'dollars', tickprefix: '$', separatethousands: true },
+  });
+}
 
 function renderSection(root, s) {
   root.appendChild(el('h2', {}, `${text(s.name)} usage`));
@@ -364,7 +667,9 @@ function renderSection(root, s) {
     [fmt(s.total.in), 'All-time input'], [fmt(s.total.out), 'All-time output'], [fmt(s.total.read), 'All-time cache read'],
   ]);
 
-  const recent = s.daily.slice(-DATA.days).map(([day, i, o, r, calls]) => ({ day, in: i, out: o, read: r, calls }));
+  if (s.priced) renderCost(root, s);
+
+  const recent = s.daily.slice(-DATA.days).map(([day, i, o, r, calls, cost]) => ({ day, in: i, out: o, read: r, calls, cost }));
   root.appendChild(el('h3', {}, `Daily tokens (last ${DATA.days} active days)`));
   chart(root, tokenTraces(recent.map(r => r.day), recent, ''), tokenLayout('%d %b', undefined));
 
@@ -388,10 +693,10 @@ function renderSection(root, s) {
   root.appendChild(el('h3', {}, 'Monthly summary'));
   root.appendChild(el('p', { class: 'note' }, 'Click a month to show its weeks and models.'));
   const wrap = el('div', { class: 'table-wrap' });
-  const table = el('table', {}, '<tr><th>Month</th><th>Input</th><th>Output</th><th>Cache read</th><th>API calls</th></tr>');
+  const table = el('table', {}, tableHead('Month', s.priced));
   s.months.forEach(m => {
     const id = `${s.name}-${m.ym}`.replace(/[^A-Za-z0-9-]/g, '');
-    const row = el('tr', { class: 'month' }, `<td>${monthLabel(m.ym)} <span class="arrow" id="a-${id}">&#9654;</span></td>${tokenCells(m)}`);
+    const row = el('tr', { class: 'month' }, `<td>${monthLabel(m.ym)} <span class="arrow" id="a-${id}">&#9654;</span></td>${tokenCells(m, s.priced)}`);
     row.addEventListener('click', () => {
       const subs = table.querySelectorAll(`.s-${id}`);
       const show = subs.length && subs[0].style.display === 'none';
@@ -400,10 +705,10 @@ function renderSection(root, s) {
     });
     table.appendChild(row);
     m.weeks.forEach(w => {
-      table.appendChild(el('tr', { class: `sub s-${id}`, style: 'display:none' }, `<td>Week ${w.week}</td>${tokenCells(w)}`));
+      table.appendChild(el('tr', { class: `sub s-${id}`, style: 'display:none' }, `<td>Week ${w.week}</td>${tokenCells(w, s.priced)}`));
     });
     Object.entries(m.models).sort((a, b) => b[1].out - a[1].out).forEach(([name, u]) => {
-      table.appendChild(el('tr', { class: `sub s-${id}`, style: 'display:none' }, `<td>${text(name)}</td>${tokenCells(u)}`));
+      table.appendChild(el('tr', { class: `sub s-${id}`, style: 'display:none' }, `<td>${text(name)}</td>${tokenCells(u, s.priced)}`));
     });
   });
   wrap.appendChild(table);
@@ -411,9 +716,9 @@ function renderSection(root, s) {
 
   root.appendChild(el('h3', {}, 'Daily breakdown'));
   const dwrap = el('div', { class: 'table-wrap' });
-  const dtable = el('table', {}, '<tr><th>Date</th><th>Input</th><th>Output</th><th>Cache read</th><th>API calls</th></tr>');
+  const dtable = el('table', {}, tableHead('Date', s.priced));
   recent.slice().reverse().forEach(r => {
-    dtable.appendChild(el('tr', {}, `<td>${dayLabel(r.day)}</td>${tokenCells(r)}`));
+    dtable.appendChild(el('tr', {}, `<td>${dayLabel(r.day)}</td>${tokenCells(r, s.priced)}`));
   });
   dwrap.appendChild(dtable);
   root.appendChild(dwrap);
@@ -423,11 +728,24 @@ const root = document.getElementById('root');
 root.appendChild(el('h1', {}, 'Token Usage Report'));
 root.appendChild(el('p', { class: 'note' },
   'Built from local Claude Code and Codex transcripts. Input includes cache writes. Each API call is counted once.'));
+if (DATA.sections.length && !DATA.sections.some(s => s.priced) && DATA.pricing_note) {
+  root.appendChild(el('p', { class: 'note' }, `No API cost estimate: ${text(DATA.pricing_note)}.`));
+}
 if (!DATA.sections.length) root.appendChild(el('p', {}, 'No Claude Code or Codex transcripts were found.'));
 DATA.sections.forEach(s => renderSection(root, s));
 root.appendChild(el('div', { class: 'footer' }, `Generated ${text(DATA.generated)}`));
 </script></body></html>
 """
+
+
+def positive_amount(value: str) -> float:
+    try:
+        amount = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value}") from None
+    if not math.isfinite(amount) or amount <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive amount: {value}")
+    return amount
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -452,13 +770,49 @@ def main(argv: list[str] | None = None) -> int:
         "--no-codex", action="store_true", help="leave out the Codex section"
     )
     parser.add_argument(
+        "--compare-model",
+        help="also price every Claude call as if it ran on this model "
+        "(default: the cheapest Opus on the pricing page)",
+    )
+    parser.add_argument(
+        "--pricing-file",
+        type=Path,
+        help=f"read prices from a saved copy of {PRICING_URL} instead of fetching it",
+    )
+    parser.add_argument(
+        "--no-cost", action="store_true", help="leave out the API cost estimate"
+    )
+    parser.add_argument(
+        "--budget",
+        type=positive_amount,
+        help="monthly API budget in dollars, drawn on the cost chart",
+    )
+    parser.add_argument(
         "--open", action="store_true", help="open the report in a browser when done"
     )
     args = parser.parse_args(argv)
-
     today = date.today()
     sections = []
-    claude = summarise("Claude Code", scan_claude(args.claude_dir), today)
+    claude_calls = scan_claude(args.claude_dir)
+    priced = False
+    compare = ""
+    pricing_note = "API cost estimate turned off."
+    if not args.no_cost:
+        pricing, pricing_note = load_pricing(args.pricing_file)
+        if not pricing.models:
+            print(f"warning: no API cost estimate: {pricing_note}", file=sys.stderr)
+        else:
+            compare = args.compare_model or default_compare_model(pricing) or ""
+            if args.compare_model and prices_for(compare, 0, pricing) is None:
+                parser.error(
+                    f"no price for {compare} on the pricing page; choose one of: "
+                    + ", ".join(sorted(pricing.models))
+                )
+            apply_costs(claude_calls, compare, pricing)
+            priced = True
+    claude = summarise(
+        "Claude Code", claude_calls, today, priced=priced, compare=compare
+    )
     if claude:
         sections.append(claude)
     if not args.no_codex:
@@ -468,10 +822,27 @@ def main(argv: list[str] | None = None) -> int:
 
     output = Path(args.output)
     output.write_text(
-        render(sections, args.days, datetime.now().strftime("%d %b %Y %H:%M")),
+        render(
+            sections,
+            args.days,
+            datetime.now().strftime("%d %b %Y %H:%M"),
+            args.budget,
+            pricing_note,
+        ),
         encoding="utf-8",
     )
     for s in sections:
+        if s["priced"]:
+            m = s["month_now"]
+            print(
+                f"{s['name']}: API cost this month so far ${m['cost']:,.0f}, "
+                f"projected ${m['projected']:,.0f}"
+                + (
+                    f" (all on {s['compare']}: ${m['projected_cmp']:,.0f})"
+                    if s["compare"]
+                    else ""
+                )
+            )
         print(
             f"{s['name']}: {fmt_count(s['total']['calls'])} API calls since {s['first_day']}"
         )

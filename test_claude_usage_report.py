@@ -111,17 +111,141 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(s["records"]["in"], ["2025-08-01", 41])
         self.assertEqual(s["records"]["out"], ["2025-08-04", 30])
         self.assertEqual(s["records"]["read"], ["2025-08-01", 900])
-        self.assertEqual(s["total"], {"in": 54, "out": 39, "read": 1050, "calls": 3})
+        self.assertEqual(
+            {k: s["total"][k] for k in ("in", "out", "read", "calls")},
+            {"in": 54, "out": 39, "read": 1050, "calls": 3},
+        )
         self.assertEqual(s["today"]["out"], 30)
         self.assertEqual(s["last7"]["calls"], 3)
         aug = s["months"][0]
         self.assertEqual(aug["ym"], "2025-08")
         self.assertEqual([w["week"] for w in aug["weeks"]], [32, 31])
         self.assertEqual(set(aug["models"]), {"a", "b"})
-        self.assertEqual(s["daily"][0], ["2025-07-30", 11, 7, 100, 1])
+        self.assertEqual(s["daily"][0], ["2025-07-30", 11, 7, 100, 1, 0.0])
 
     def test_no_calls_gives_no_section(self):
         self.assertIsNone(r.summarise("Codex", [], date(2026, 1, 1)))
+
+
+PAGE = """
+# Pricing
+
+| Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
+| --- | --- | --- | --- | --- | --- |
+| Claude Opus 6 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.15 / MTok<sup>1</sup> | $15 / MTok |
+| Claude Opus 5.5 | $4 / MTok | $5 / MTok | $8 / MTok | $0.20 / MTok<sup>2</sup> | $20 / MTok |
+| Claude Opus 4.1 ([retired](https://example.com)) | $15 / MTok | $18.75 / MTok | $30 / MTok | $1.50 / MTok | $75 / MTok |
+| Claude Haiku 5.5 (for prompts up to 100,000 tokens) | $0.10 / MTok | $0.125 / MTok | $0.20 / MTok | $0.01 / MTok | $0.50 / MTok |
+| Claude Haiku 5.5 (for prompts over 100,000 tokens) | $0.50 / MTok | $0.625 / MTok | $1 / MTok | $0.05 / MTok | $2.50 / MTok |
+
+| Model | Batch input | Batch output |
+| --- | --- | --- |
+| Claude Opus 6 | $1.50 / MTok | $7.50 / MTok |
+"""
+
+
+class PricingTests(unittest.TestCase):
+    def setUp(self):
+        self.pricing = r.parse_pricing(PAGE, "test")
+
+    def test_new_models_are_read_from_the_page_without_code_changes(self):
+        self.assertEqual(
+            self.pricing.models["claude-opus-6"], (3.0, 3.75, 6.0, 0.15, 15.0)
+        )
+        self.assertEqual(self.pricing.models["claude-opus-4-1"][0], 15.0)
+        self.assertEqual(
+            sorted(self.pricing.models),
+            ["claude-haiku-5-5", "claude-opus-4-1", "claude-opus-5-5", "claude-opus-6"],
+        )
+
+    def test_transcript_model_ids_map_onto_page_names(self):
+        for model, expected in (
+            ("claude-opus-6", 3.0),
+            ("claude-opus-4-1-20250805", 15.0),
+            ("us.anthropic.claude-opus-4-1-20250805-v1:0", 15.0),
+            ("claude-opus-5-5[1m]", 4.0),
+        ):
+            self.assertEqual(r.prices_for(model, 0, self.pricing)[0], expected, model)
+        self.assertIsNone(r.prices_for("claude-unknown-9", 0, self.pricing))
+
+    def test_long_prompt_tier_applies_above_its_threshold(self):
+        self.assertEqual(
+            r.prices_for("claude-haiku-5-5", 100_000, self.pricing)[0], 0.1
+        )
+        self.assertEqual(
+            r.prices_for("claude-haiku-5-5", 100_001, self.pricing)[0], 0.5
+        )
+
+    def test_default_comparison_is_the_cheapest_opus_on_the_page(self):
+        self.assertEqual(r.default_compare_model(self.pricing), "claude-opus-6")
+        self.assertIsNone(r.default_compare_model(r.Pricing()))
+
+    def test_costs_split_cache_writes_and_flag_unpriced_models(self):
+        priced = r.Call(
+            "2026-10-01",
+            "claude-opus-5-5",
+            r.Usage(
+                input=1_000_000,
+                cache_write=3_000_000,
+                cache_write_1h=1_000_000,
+                cache_read=10_000_000,
+                output=1_000_000,
+                calls=1,
+            ),
+        )
+        unknown = r.Call("2026-10-01", "claude-unknown-9", r.Usage(input=5, calls=1))
+        r.apply_costs([priced, unknown], "claude-opus-6", self.pricing)
+        u = priced.usage
+        self.assertAlmostEqual(u.cost_input, 4.0)
+        self.assertAlmostEqual(u.cost_write, 2 * 5.0 + 1 * 8.0)
+        self.assertAlmostEqual(u.cost_read, 2.0)
+        self.assertAlmostEqual(u.cost_output, 20.0)
+        self.assertAlmostEqual(u.cost_compare, 3.0 + 2 * 3.75 + 6.0 + 1.5 + 15.0)
+        self.assertEqual(unknown.usage.unpriced, 1)
+        self.assertEqual(unknown.usage.cost(), 0)
+
+    def test_falls_back_to_the_saved_copy_when_the_fetch_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "pricing.md"
+            cache.write_text(PAGE)
+            pricing, note = r.load_pricing(
+                None, url="http://127.0.0.1:9/none", cache=cache
+            )
+            self.assertIn("claude-opus-6", pricing.models)
+            self.assertIn("using the copy saved", note)
+            cache.unlink()
+            pricing, note = r.load_pricing(
+                None, url="http://127.0.0.1:9/none", cache=cache
+            )
+            self.assertEqual(pricing.models, {})
+            self.assertIn("could not fetch", note)
+
+    def test_linked_model_names_are_still_read(self):
+        page = PAGE.replace(
+            "| Claude Haiku 5.5 (for prompts over",
+            "| [Claude Haiku 5.5](https://example.com/haiku) (for prompts over",
+        )
+        pricing = r.parse_pricing(page, "test")
+        self.assertEqual(pricing.long_prompt["claude-haiku-5-5"][0], 100_000)
+
+    def test_unreadable_saved_copy_gives_no_prices_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "pricing.md"
+            cache.mkdir()
+            pricing, note = r.load_pricing(
+                None, url="http://127.0.0.1:9/none", cache=cache
+            )
+            self.assertEqual(pricing.models, {})
+            self.assertIn("could not fetch", note)
+
+    def test_budget_must_be_positive_and_finite(self):
+        self.assertEqual(r.positive_amount("1000"), 1000.0)
+        for bad in ("nan", "inf", "1e309", "0", "-5", "lots"):
+            with self.assertRaises(r.argparse.ArgumentTypeError, msg=bad):
+                r.positive_amount(bad)
+
+    def test_unreadable_page_gives_no_prices(self):
+        self.assertEqual(r.parse_pricing("# nothing here", "x").models, {})
 
 
 class RenderTests(unittest.TestCase):
